@@ -198,7 +198,9 @@ void app_main()
 
     wifi_event_group = xEventGroupCreate();
 
-    Rotator rotator;
+    RotatorScale azimuth_scale(550*OVERSAMPLING, 4010*OVERSAMPLING, 0, 36000);
+    RotatorScale elevation_scale(500*OVERSAMPLING, 4010*OVERSAMPLING, 0, 18000);
+    Rotator rotator(azimuth_scale, elevation_scale);
 
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_EVENT, false, true, portMAX_DELAY);
     ESP_LOGI(TAG, "Init done - starting app");

@@ -3,12 +3,10 @@
 
 #include <driver/gpio.h>
 #include <driver/adc.h>
-#include <driver/timer.h>
+#include <string>
 
-#define OVERSAMPLING 16
+#define OVERSAMPLING 8
 #define UPDATE_RATE 50 /* Hz */
-#define TIMER_CLOCK_FREQ 80000000
-#define TIMER_CLOCK_DIVIDER 80
 
 class RotatorScale
 {
@@ -37,42 +35,64 @@ private:
 class RotatorAxis
 {
 public:
-    RotatorAxis(gpio_num_t pin_more, gpio_num_t pin_less,
-                adc1_channel_t adc_channel, RotatorScale &scale)
-        : pin_more(pin_more)
+    RotatorAxis(std::string name, gpio_num_t pin_more, gpio_num_t pin_less,
+                adc1_channel_t adc_channel, int start_threshold, int stop_threshold, RotatorScale &scale)
+        : name(name)
+        , pin_more(pin_more)
         , pin_less(pin_less)
         , adc_channel(adc_channel)
+        , start_threshold(start_threshold)
+        , stop_threshold(stop_threshold)
         , scale(scale)
-        , adc(0)
-        , adc_count(0)
-        , position(0)
+        , state(STOPPED)
+        , sample(0)
+        , sample_count(0)
+        , current_position(0)
+        , wanted_position(0)
         { };
-    void IRAM_ATTR adc_isr(); /* Called from ISR */
-    int get_position() { return scale.convert(position); };
+    void poll();
+    int get_current_position();
+    void set_wanted_position(int position);
+    void stop();
+
 private:
+    enum State {
+        STOPPED,
+        TRACKING,
+        RUNNING_MORE,
+        RUNNING_LESS,
+    };
+
+    std::string name;
+
     /* Physical I/O mapping */
     gpio_num_t pin_more;
     gpio_num_t pin_less;
     adc1_channel_t adc_channel;
 
+    int start_threshold;
+    int stop_threshold;
     RotatorScale &scale;
-
-    int adc;
-    int adc_count;
-
-    int position;
+    enum State state;
+    int sample;
+    int sample_count;
+    int current_position;
+    int wanted_position;
 };
 
 class Rotator
 {
 public:
-    Rotator();
+    Rotator(RotatorScale &azimuth_scale, RotatorScale &elevation_scale);
     void get_position(float *azi, float *ele);
     void set_position(float azi, float ele);
     void run_task();
 private:
-    RotatorScale scales[2];
-    RotatorAxis axes[2];
+    RotatorScale &azimuth_scale;
+    RotatorScale &elevation_scale;
+
+    RotatorAxis azimuth_axis;
+    RotatorAxis elevation_axis;
 };
 
 #endif /* ! __ROTATOR_H_INCLUDED__ */

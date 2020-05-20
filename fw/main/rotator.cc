@@ -5,11 +5,6 @@
 
 #include "rotator.h"
 
-#define AZI_DEADBAND 1.0f /* degrees */
-#define ELE_DEADBAND 1.0f /* degrees */
-#define AZI_SPEED 10.0f /* degrees/second */
-#define ELE_SPEED 10.0f /* degrees/second */
-
 #define ROTATOR_PIN_UP GPIO_NUM_14
 #define ROTATOR_PIN_DOWN GPIO_NUM_27
 #define ROTATOR_PIN_LEFT GPIO_NUM_13
@@ -17,33 +12,78 @@
 
 static const char *TAG = "rotator";
 
-static void IRAM_ATTR
-timer_group0_isr(void *param)
+void RotatorAxis::poll()
 {
-    timer_spinlock_take(TIMER_GROUP_0);
-    RotatorAxis *axes = (RotatorAxis *)param;
-
-    for (int i=0; i < 2; i++)
+    sample += adc1_get_raw(adc_channel);
+    if (sample_count++ >= OVERSAMPLING)
     {
-        axes[i].adc_isr();
+        current_position = scale.convert(sample);
+        //ESP_LOGI(TAG, "%s: ADC=%d POS=%d (%d) channel=%d", name.c_str(), sample, current_position, wanted_position, adc_channel);
+        sample = 0;
+        sample_count = 0;
+
+        switch (state)
+        {
+        case STOPPED:
+            gpio_set_level(pin_more, 0);
+            gpio_set_level(pin_less, 0);
+            break;
+        case TRACKING:
+            if ((current_position - start_threshold) > wanted_position)
+            {
+                gpio_set_level(pin_more, 0);
+                gpio_set_level(pin_less, 1);
+                ESP_LOGI(TAG, "%s: turning less %d -> %d", name.c_str(), current_position, wanted_position);
+                state = RUNNING_LESS;
+            }
+            else if ((current_position + start_threshold) < wanted_position)
+            {
+                gpio_set_level(pin_more, 1);
+                gpio_set_level(pin_less, 0);
+                ESP_LOGI(TAG, "%s: turning more %d -> %d", name.c_str(), current_position, wanted_position);
+                state = RUNNING_MORE;
+            }
+            break;
+        case RUNNING_MORE:
+            if ((current_position + stop_threshold) > wanted_position)
+            {
+                gpio_set_level(pin_more, 0);
+                gpio_set_level(pin_less, 0);
+                ESP_LOGI(TAG, "%s: turning more done %d -> %d", name.c_str(), current_position, wanted_position);
+                state = TRACKING;
+            }
+            break;
+        case RUNNING_LESS:
+            if ((current_position - stop_threshold) < wanted_position)
+            {
+                gpio_set_level(pin_more, 0);
+                gpio_set_level(pin_less, 0);
+                ESP_LOGI(TAG, "%s: turning less done %d -> %d", name.c_str(), current_position, wanted_position);
+                state = TRACKING;
+            }
+            break;
+        }
+
     }
 
-    timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
-    timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
-    timer_spinlock_give(TIMER_GROUP_0);
-}
-
-void IRAM_ATTR RotatorAxis::adc_isr()
-{
-     adc += adc1_get_raw(adc_channel);
-     adc_count ++;
-     if (adc_count >= OVERSAMPLING)
-     {
-         position = adc;
-         adc = 0;
-         adc_count = 0;
-     }
 };
+
+int RotatorAxis::get_current_position()
+{
+    return current_position;
+};
+
+void RotatorAxis::set_wanted_position(int position)
+{
+    wanted_position = position;
+    state = TRACKING;
+};
+
+void RotatorAxis::stop() {
+    state = STOPPED;
+    gpio_set_level(pin_more, 0);
+    gpio_set_level(pin_less, 0);
+}
 
 static void rotator_task(void *pvParameters)
 {
@@ -51,25 +91,26 @@ static void rotator_task(void *pvParameters)
     rotator->run_task();
 }
 
-Rotator::Rotator()
-    : scales({
-        RotatorScale(0, 4095*OVERSAMPLING, 0, 1800),
-        RotatorScale(0, 4095*OVERSAMPLING, 0, 3600),
-    })
-    , axes({
-        RotatorAxis(ROTATOR_PIN_UP, ROTATOR_PIN_DOWN, ADC1_CHANNEL_0, scales[0]),
-        RotatorAxis(ROTATOR_PIN_LEFT, ROTATOR_PIN_RIGHT, ADC1_CHANNEL_1, scales[1]),
-    })
+Rotator::Rotator(RotatorScale &azimuth_scale, RotatorScale &elevation_scale)
+    : azimuth_scale(azimuth_scale)
+    , elevation_scale(elevation_scale)
+    , azimuth_axis("azimuth", ROTATOR_PIN_RIGHT, ROTATOR_PIN_LEFT, ADC1_CHANNEL_3, 300, 100, azimuth_scale)
+    , elevation_axis("elevation", ROTATOR_PIN_DOWN, ROTATOR_PIN_UP, ADC1_CHANNEL_0, 300, 100, elevation_scale)
 {
     xTaskCreate(rotator_task, "rotator", 4096, this, 5, NULL);
 }
 
 void Rotator::set_position(float azi, float ele)
 {
+    ESP_LOGI(TAG, "Set position: %1.2f/%1.2f", azi, ele);
+    azimuth_axis.set_wanted_position(azi*100);
+    elevation_axis.set_wanted_position(ele*100);
 }
 
 void Rotator::get_position(float *azi, float *ele)
 {
+    *azi = azimuth_axis.get_current_position()/100.0;
+    *ele = elevation_axis.get_current_position()/100.0;
 }
 
 void Rotator::run_task()
@@ -87,39 +128,11 @@ void Rotator::run_task()
     adc1_config_channel_atten(ADC1_CHANNEL_0,ADC_ATTEN_DB_11);
     adc1_config_channel_atten(ADC1_CHANNEL_3,ADC_ATTEN_DB_11);
 
-    timer_config_t timer_cfg = {
-        .alarm_en = TIMER_ALARM_EN,
-        .counter_en = TIMER_PAUSE,
-        .intr_type = TIMER_INTR_LEVEL,
-        .counter_dir = TIMER_COUNT_UP,
-        .auto_reload = TIMER_AUTORELOAD_EN,
-        .divider = TIMER_CLOCK_DIVIDER,
-    };
-    timer_init(TIMER_GROUP_0, TIMER_0, &timer_cfg);
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0x00000000ULL);
-    timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, (TIMER_CLOCK_FREQ/TIMER_CLOCK_DIVIDER)/(UPDATE_RATE*OVERSAMPLING));
-    ESP_LOGI(TAG, "ALARM %d", (TIMER_CLOCK_FREQ/TIMER_CLOCK_DIVIDER)/(UPDATE_RATE*OVERSAMPLING));
-    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
-    timer_isr_register(TIMER_GROUP_0, TIMER_0, timer_group0_isr,
-                       (void *) axes, ESP_INTR_FLAG_IRAM, NULL);
-    timer_start(TIMER_GROUP_0, TIMER_0);
-
     while(1)
     {
-        vTaskDelay(1000 / (portTICK_PERIOD_MS));
-        ESP_LOGI(TAG, "ele=%1.1f azi=%1.1f", axes[0].get_position()/10.0, axes[1].get_position()/10.0);
-#if 0
-        gpio_set_level(ROTATOR_PIN_UP, 1);
-        vTaskDelay(1000 / (portTICK_PERIOD_MS));
-
-        gpio_set_level(ROTATOR_PIN_UP, 0);
-        vTaskDelay(1000 / (portTICK_PERIOD_MS));
-
-        gpio_set_level(ROTATOR_PIN_DOWN, 1);
-        vTaskDelay(1000 / (portTICK_PERIOD_MS));
-
-        gpio_set_level(ROTATOR_PIN_DOWN, 0);
-        vTaskDelay(1000 / (portTICK_PERIOD_MS));
-#endif
+        vTaskDelay((1000 / (UPDATE_RATE*OVERSAMPLING)) / (portTICK_PERIOD_MS));
+        azimuth_axis.poll();
+        elevation_axis.poll();
+        //ESP_LOGI(TAG, "azi=%d", azimuth_axis.get_current_position());
     }
 }
